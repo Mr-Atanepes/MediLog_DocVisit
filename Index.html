@@ -572,6 +572,43 @@
       .save-btn:active {
         transform: scale(0.98);
       }
+      .save-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none;
+      }
+      .save-status {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 6px 0 0;
+        display: none;
+        align-items: center;
+        gap: 6px;
+      }
+      .save-status.error {
+        color: var(--danger);
+      }
+      .save-status.success {
+        color: var(--green);
+      }
+      .retry-btn {
+        margin-top: 8px;
+        width: 100%;
+        background: var(--surface2);
+        color: var(--accent);
+        border: 1px solid var(--accent);
+        border-radius: var(--radius-sm);
+        padding: 10px;
+        font-family: "Syne", sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+      .retry-btn:hover {
+        background: var(--accent);
+        color: white;
+      }
 
       /* ----------------------------------------------
          CUSTOM SELECT DROPDOWN
@@ -1494,6 +1531,7 @@
             placeholder="Brief reason or reminder..."
           ></textarea>
         </div>
+        <div id="saveStatus" class="save-status"></div>
         <button class="save-btn" id="saveBtn">Save Visit</button>
       </div>
 
@@ -1727,7 +1765,6 @@
           const SPACER_COUNT = 2;
           const items = Array.from(container.querySelectorAll(".picker-item:not(.picker-spacer)"));
           if (items.length === 0) return null;
-          // The center row is at scrollTop = N * ITEM_H where N is the data item index
           const scrollTop = container.scrollTop;
           const idx = Math.round(scrollTop / ITEM_H);
           const clamped = Math.max(0, Math.min(idx, items.length - 1));
@@ -1761,10 +1798,8 @@
           if (targetItem) {
             const ITEM_H = 44;
             const SPACER_COUNT = 2;
-            // Find the index of targetItem among all children
             const allChildren = Array.from(container.children);
             const childIdx = allChildren.indexOf(targetItem);
-            // scrollTop so this item lands in the center (row index 2, 0-based)
             const scrollTop = (childIdx - SPACER_COUNT) * ITEM_H;
             container.scrollTop = Math.max(0, scrollTop);
             targetItem.classList.add("selected");
@@ -1778,7 +1813,6 @@
           scrollToPickerItem(hourCol, currentHour12, true, false);
           scrollToPickerItem(minuteCol, currentMinute, true, false);
           scrollToPickerItem(ampmCol, currentAmPm, false, true);
-          // Highlight immediately after setting scrollTop
           updateSelectedFromCentered(hourCol, "hour");
           updateSelectedFromCentered(minuteCol, "minute");
           updateSelectedFromCentered(ampmCol, "ampm");
@@ -1807,11 +1841,9 @@
               snapScrollToNearest(col);
               updateSelectedFromCentered(col, type);
             };
-            // Use scrollend if available (Chrome 114+, Safari 17.4+)
             if ("onscrollend" in col) {
               col.addEventListener("scrollend", onScrollEnd);
             }
-            // Also use fallback timeout for older Android WebView
             col.addEventListener("scroll", () => {
               if (scrollTimeout) clearTimeout(scrollTimeout);
               scrollTimeout = setTimeout(onScrollEnd, 80);
@@ -1840,7 +1872,6 @@
           if (window.innerWidth <= 480) document.body.classList.add("modal-open");
           timePickerCallback = onConfirm;
           
-          // Ensure columns are built and then sync
           setTimeout(() => {
             syncAllColumnsToValues();
           }, 10);
@@ -2003,6 +2034,17 @@
           document.getElementById("formCard").classList.add("visible");
           document.getElementById("modalBackdrop").classList.add("visible");
           if (window.innerWidth <= 480) document.body.classList.add("modal-open");
+          // Clear any previous status
+          const status = document.getElementById("saveStatus");
+          status.style.display = "none";
+          status.className = "save-status";
+          // Remove any retry button
+          const retry = document.querySelector(".retry-btn");
+          if (retry) retry.remove();
+          // Reset save button
+          const saveBtn = document.getElementById("saveBtn");
+          saveBtn.disabled = false;
+          saveBtn.textContent = editIndex >= 0 ? "Update Visit" : "Save Visit";
         }
         
         function hideForm() {
@@ -2027,6 +2069,12 @@
           document.getElementById("formTitle").textContent = "New Visit";
           document.getElementById("saveBtn").textContent = "Save Visit";
           editIndex = -1;
+          // Clear status
+          const status = document.getElementById("saveStatus");
+          status.style.display = "none";
+          status.className = "save-status";
+          const retry = document.querySelector(".retry-btn");
+          if (retry) retry.remove();
         }
         
         function openEditForm(i) {
@@ -2061,6 +2109,31 @@
           showForm();
         }
 
+        // ========== SYNC HELPER ==========
+        async function performSync() {
+          const cfg = getGithubConfig();
+          if (!cfg) return;
+          const remote = await githubGetFile(cfg);
+          let remoteData = {};
+          let sha = null;
+          if (remote) {
+            sha = remote.sha;
+            const decoded = decodeURIComponent(escape(atob(remote.content.replace(/\n/g, ''))));
+            remoteData = JSON.parse(decoded);
+          }
+          const localData = JSON.parse(localStorage.getItem('medilog') || '{}');
+          const merged = Object.assign({}, remoteData, localData);
+          localStorage.setItem('medilog', JSON.stringify(merged));
+          await githubPutFile(cfg, merged, sha);
+          const now = new Date().toISOString();
+          localStorage.setItem(LAST_SYNC_KEY, now);
+          setSyncUI('online', formatSyncTime(now));
+          if (typeof window.__medilogRefresh === 'function') {
+            window.__medilogRefresh();
+          }
+        }
+
+        // ========== IMPROVED SAVE VISIT ==========
         function saveVisit() {
           let doctor = doctorHidden.value;
           const time = document.getElementById("fTime").value;
@@ -2086,16 +2159,99 @@
             entry.originalType = "Other";
             entry.customDoctorName = customDoctorName;
           }
-          if (editIndex >= 0) visits[editIndex] = entry;
-          else {
+          // Local save
+          if (editIndex >= 0) {
+            visits[editIndex] = entry;
+          } else {
             visits.push(entry);
             visits.sort((a, b) => a.time.localeCompare(b.time));
           }
           setVisits(key, visits);
-          hideForm();
+          // Update UI immediately
           renderVisitsList();
           renderCalendar();
           updateStats();
+
+          const saveBtn = document.getElementById("saveBtn");
+          const status = document.getElementById("saveStatus");
+          // If offline or no GitHub config, close after saving
+          const cfg = getGithubConfig();
+          if (!navigator.onLine) {
+            // Offline - show badge then close
+            const dayTitle = document.getElementById("dayTitle");
+            const original = dayTitle.textContent;
+            dayTitle.textContent = original + " 📴 (Saved Offline)";
+            setTimeout(() => { dayTitle.textContent = original; }, 3000);
+            hideForm();
+            return;
+          }
+          if (!cfg) {
+            // No sync configured, just close
+            hideForm();
+            return;
+          }
+
+          // Try to sync
+          status.style.display = "flex";
+          status.className = "save-status";
+          status.textContent = "🔄 Syncing to GitHub...";
+          saveBtn.disabled = true;
+          saveBtn.textContent = "💾 Syncing...";
+
+          performSync().then(() => {
+            // Success
+            status.textContent = "✅ Synced successfully";
+            status.className = "save-status success";
+            saveBtn.disabled = false;
+            saveBtn.textContent = editIndex >= 0 ? "Update Visit" : "Save Visit";
+            setTimeout(() => {
+              hideForm();
+            }, 600);
+          }).catch((err) => {
+            console.warn("Sync failed:", err);
+            // Keep form open, show error, retry button
+            status.textContent = "⚠️ Sync failed — data saved locally";
+            status.className = "save-status error";
+            saveBtn.disabled = false;
+            saveBtn.textContent = editIndex >= 0 ? "Update Visit" : "Save Visit";
+            // Remove any existing retry
+            const existing = document.querySelector(".retry-btn");
+            if (existing) existing.remove();
+            const retryBtn = document.createElement("button");
+            retryBtn.className = "retry-btn";
+            retryBtn.textContent = "🔄 Retry Sync";
+            retryBtn.onclick = function() {
+              this.remove();
+              // Re-trigger save (will re-save locally but that's idempotent)
+              // We need to ensure we don't duplicate if editIndex is set.
+              // Actually we can just call performSync directly with the current data?
+              // Since we already saved locally, we just need to sync again.
+              // We'll call performSync again but that will merge and push all data.
+              status.textContent = "🔄 Retrying sync...";
+              status.className = "save-status";
+              saveBtn.disabled = true;
+              saveBtn.textContent = "💾 Syncing...";
+              performSync().then(() => {
+                status.textContent = "✅ Synced successfully";
+                status.className = "save-status success";
+                saveBtn.disabled = false;
+                saveBtn.textContent = editIndex >= 0 ? "Update Visit" : "Save Visit";
+                setTimeout(() => { hideForm(); }, 600);
+              }).catch(() => {
+                status.textContent = "⚠️ Sync failed again — data saved locally";
+                status.className = "save-status error";
+                saveBtn.disabled = false;
+                saveBtn.textContent = editIndex >= 0 ? "Update Visit" : "Save Visit";
+                // Re-add retry button
+                const newRetry = document.createElement("button");
+                newRetry.className = "retry-btn";
+                newRetry.textContent = "🔄 Retry Sync";
+                newRetry.onclick = arguments.callee; // recursive
+                document.getElementById("saveBtn").parentNode.appendChild(newRetry);
+              });
+            };
+            document.getElementById("saveBtn").parentNode.appendChild(retryBtn);
+          });
         }
 
         function deleteVisit(i) {
@@ -2349,9 +2505,9 @@
           'Accept': 'application/vnd.github+json'
         }
       });
-      if (res.status === 404) return null; // file doesn't exist yet
+      if (res.status === 404) return null;
       if (!res.ok) throw new Error(`GitHub GET failed: ${res.status}`);
-      return res.json(); // { content, sha, ... }
+      return res.json();
     }
 
     async function githubPutFile(cfg, content, sha) {
@@ -2375,17 +2531,6 @@
     }
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║           MERGE STRATEGY                                ║
-    // ║  Local wins on conflict (last-write from this device)   ║
-    // ╚══════════════════════════════════════════════════════════╝
-    function mergeData(local, remote) {
-      // remote is source of truth for keys not in local,
-      // local wins for keys that exist in both
-      const merged = Object.assign({}, remote, local);
-      return merged;
-    }
-
-    // ╔══════════════════════════════════════════════════════════╗
     // ║           MAIN SYNC FUNCTION                            ║
     // ╚══════════════════════════════════════════════════════════╝
     async function triggerSync() {
@@ -2402,7 +2547,6 @@
       setSyncUI('syncing', 'Syncing with GitHub…');
 
       try {
-        // 1. Fetch remote file
         const remote = await githubGetFile(cfg);
         let remoteData = {};
         let sha = null;
@@ -2413,22 +2557,16 @@
           remoteData = JSON.parse(decoded);
         }
 
-        // 2. Merge: local wins on conflict
         const localData = JSON.parse(localStorage.getItem('medilog') || '{}');
-        const merged    = mergeData(localData, remoteData);
+        const merged    = Object.assign({}, remoteData, localData);
 
-        // 3. Write merged data back to localStorage
         localStorage.setItem('medilog', JSON.stringify(merged));
-
-        // 4. Push merged data to GitHub
         await githubPutFile(cfg, merged, sha);
 
-        // 5. Update UI and timestamp
         const now = new Date().toISOString();
         localStorage.setItem(LAST_SYNC_KEY, now);
         setSyncUI('online', formatSyncTime(now));
 
-        // 6. Re-render app with merged data
         if (typeof window.__medilogRefresh === 'function') {
           window.__medilogRefresh();
         }
@@ -2457,7 +2595,6 @@
         setSyncUI('offline', 'Tap ⟳ Sync to set up GitHub');
       } else {
         setSyncUI('online', last ? formatSyncTime(last) : 'Connected — tap to sync');
-        // Auto-sync on load if config exists
         triggerSync();
       }
     });
